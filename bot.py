@@ -65,47 +65,58 @@ async def api_request(method: str, endpoint: str, json_data: dict = None) -> dic
 
 
 async def find_plan_id() -> Optional[str]:
-    """Быстрый поиск тарифа за $1 по всем страницам"""
+    """Ищем тариф через search + fallback по всем страницам"""
     try:
-        page = 1
-        found_any = []
+        # 1. Сначала быстрый поиск через search
+        data = await api_request(
+            "GET",
+            f"rents/plans?search={SERVICE_NAME}&per_page=100&include_unavailable=1"
+        )
+        plans = data.get("data", [])
+        logger.info(f"search='{SERVICE_NAME}' → найдено планов: {len(plans)}")
 
-        while page <= 20:  # защита от бесконечного цикла
+        for p in plans:
+            name = p.get("service", {}).get("name", "")
+            price = float(p.get("price", 0))
+            available = p.get("is_available")
+            logger.info(f"  {name} | ${price} | available={available}")
+
+            if SERVICE_NAME.lower() in name.lower() and abs(price - TARGET_PRICE) < 0.01:
+                if available is True:
+                    logger.info(f"Выбран (search): {name} | ${price}")
+                    return p["id"]
+
+        # 2. Если через search не нашли за $1 — берём любой тариф этого сервиса
+        for p in plans:
+            name = p.get("service", {}).get("name", "")
+            if SERVICE_NAME.lower() in name.lower() and p.get("is_available") is True:
+                logger.info(f"Выбран любой доступный: {name} | ${p.get('price')}")
+                return p["id"]
+
+        # 3. Fallback — листаем страницы
+        page = 1
+        while page <= 15:
             data = await api_request(
                 "GET",
                 f"rents/plans?per_page=100&page={page}&include_unavailable=1"
             )
             plans = data.get("data", [])
             meta = data.get("meta", {})
-            total_pages = meta.get("last_page", 1)
-
-            logger.info(f"Страница {page}/{total_pages} | планов: {len(plans)}")
-
-            if not plans:
-                break
+            total = meta.get("last_page", 1)
+            logger.info(f"Страница {page}/{total}")
 
             for p in plans:
                 name = p.get("service", {}).get("name", "")
                 price = float(p.get("price", 0))
-                available = p.get("is_available")
-
                 if SERVICE_NAME.lower() in name.lower() and abs(price - TARGET_PRICE) < 0.01:
-                    logger.info(f"Найден: {name} | ${price} | available={available} | id={p.get('id')}")
-                    if available is True:
-                        return p["id"]  # сразу возвращаем доступный
-                    found_any.append(p)
+                    logger.info(f"Найден на стр.{page}: {name} | ${price}")
+                    return p["id"]
 
-            if page >= total_pages:
+            if page >= total or not plans:
                 break
             page += 1
 
-        # Если доступного не нашли — берём любой за $1
-        if found_any:
-            best = found_any[0]
-            logger.info(f"Доступных нет, берём: {best['service']['name']} | ${best.get('price')}")
-            return best["id"]
-
-        logger.warning(f"Тариф {SERVICE_NAME} за ${TARGET_PRICE} не найден ни на одной странице")
+        logger.warning(f"Не найден: {SERVICE_NAME} за ${TARGET_PRICE}")
         return None
 
     except Exception as e:
@@ -134,9 +145,9 @@ async def buying_loop(plan_id: str):
 
     await bot.send_message(
         ADMIN_ID,
-        f"🚀 Скупка <b>{SERVICE_NAME}</b> по <b>${TARGET_PRICE}</b>\n"
-        f"Пачки по 25 | каждые 0.5 сек\n"
-        f"/stop — остановить",
+        f"🚀 Скупка <b>{SERVICE_NAME}</b>\n"
+        f"Пачки по 25 | 0.5 сек\n"
+        f"/stop — стоп",
         parse_mode="HTML",
         reply_markup=menu
     )
@@ -155,8 +166,7 @@ async def buying_loop(plan_id: str):
                     last_report = bought_count
                     await bot.send_message(
                         ADMIN_ID,
-                        f"✅ Куплено: <b>{bought_count}</b> | +{rented}\n"
-                        f"<code>{last_phone}</code>",
+                        f"✅ <b>{bought_count}</b> | +{rented}\n<code>{last_phone}</code>",
                         parse_mode="HTML"
                     )
 
@@ -165,7 +175,7 @@ async def buying_loop(plan_id: str):
     status = "Остановлен"
     await bot.send_message(
         ADMIN_ID,
-        f"🛑 Остановлено. Куплено: <b>{bought_count}</b>",
+        f"🛑 Стоп. Куплено: <b>{bought_count}</b>",
         parse_mode="HTML",
         reply_markup=menu
     )
@@ -183,7 +193,7 @@ async def wait_and_start(target: datetime):
         if plan_id:
             await buying_loop(plan_id)
         else:
-            await bot.send_message(ADMIN_ID, f"❌ {SERVICE_NAME} за ${TARGET_PRICE} не найден")
+            await bot.send_message(ADMIN_ID, f"❌ {SERVICE_NAME} не найден")
 
 
 @dp.message(Command("start"))
@@ -191,9 +201,7 @@ async def cmd_start(message: Message):
     if not is_admin(message):
         return
     await message.answer(
-        f"🤖 GotSMS Buyer\n"
-        f"Сервис: <b>{SERVICE_NAME}</b>\n"
-        f"Цена: <b>${TARGET_PRICE}</b>",
+        f"🤖 GotSMS Buyer\nСервис: <b>{SERVICE_NAME}</b>\nЦена: ${TARGET_PRICE}",
         parse_mode="HTML",
         reply_markup=menu
     )
@@ -210,13 +218,13 @@ async def cmd_start_now(message: Message):
         await message.answer("⚠️ Уже скупаю")
         return
 
-    await message.answer("🔍 Ищу тариф по всем страницам...")
+    await message.answer(f"🔍 Ищу <b>{SERVICE_NAME}</b>...", parse_mode="HTML")
 
     plan_id = await find_plan_id()
     if not plan_id:
         await message.answer(
-            f"❌ <b>{SERVICE_NAME}</b> за <b>${TARGET_PRICE}</b> не найден.\n"
-            f"Проверь название сервиса в Variables.",
+            f"❌ <b>{SERVICE_NAME}</b> не найден.\n"
+            f"Проверь SERVICE_NAME в Railway Variables.",
             parse_mode="HTML"
         )
         return
@@ -250,7 +258,7 @@ async def cmd_start_at(message: Message, command: CommandObject):
     if target <= now:
         target += timedelta(days=1)
 
-    await message.answer(f"⏳ Старт в {target.strftime('%d.%m %H:%M')} МСК")
+    await message.answer(f"⏳ Старт {target.strftime('%d.%m %H:%M')} МСК")
     buying_task = asyncio.create_task(wait_and_start(target))
 
 
@@ -290,7 +298,6 @@ async def cmd_status(message: Message):
     await message.answer(
         f"Статус: <b>{status}</b>\n"
         f"Сервис: {SERVICE_NAME}\n"
-        f"Цена: ${TARGET_PRICE}\n"
         f"Куплено: <b>{bought_count}</b>\n"
         f"МСК: {datetime.now(TZ).strftime('%H:%M:%S')}",
         parse_mode="HTML",
