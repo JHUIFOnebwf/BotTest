@@ -15,6 +15,7 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 GOTSMS_API_KEY = os.environ["GOTSMS_API_KEY"]
 ADMIN_ID = int(os.environ["ADMIN_ID"])
 SERVICE_NAME = os.getenv("SERVICE_NAME", "Telegram")
+TARGET_PRICE = 1.0   # фиксированная цена $1
 # ===============================================
 
 BASE_URL = "https://app.gotsms.com/api"
@@ -65,41 +66,40 @@ async def api_request(method: str, endpoint: str, json_data: dict = None) -> dic
 
 
 async def find_plan_id() -> Optional[str]:
+    """Ищем тариф сервиса строго по цене $1"""
     try:
-        # Берём все планы, включая недоступные
         data = await api_request("GET", "rents/plans?per_page=100&include_unavailable=1")
         plans = data.get("data", [])
 
         logger.info(f"Получено планов: {len(plans)}")
-        logger.info(f"Ищем сервис содержащий: '{SERVICE_NAME}'")
+        logger.info(f"Ищем сервис: '{SERVICE_NAME}' | цена: ${TARGET_PRICE}")
 
         suitable = []
         for p in plans:
             name = p.get("service", {}).get("name", "")
+            price = float(p.get("price", 0))
             available = p.get("is_available")
-            price = p.get("price")
             plan_id = p.get("id")
-            logger.info(f"  {name} | available={available} | price={price} | id={plan_id}")
 
-            if SERVICE_NAME.lower() in name.lower():
+            logger.info(f"  {name} | price={price} | available={available} | id={plan_id}")
+
+            if SERVICE_NAME.lower() in name.lower() and abs(price - TARGET_PRICE) < 0.01:
                 suitable.append(p)
 
         if not suitable:
-            logger.warning("Ни одного плана с таким названием не найдено")
+            logger.warning(f"Не найден тариф {SERVICE_NAME} за ${TARGET_PRICE}")
             return None
 
         # Сначала доступные
         available = [p for p in suitable if p.get("is_available") is True]
         if available:
-            available.sort(key=lambda x: float(x.get("price", 9999)))
             best = available[0]
             logger.info(f"Выбран доступный: {best['service']['name']} | ${best.get('price')}")
             return best["id"]
 
-        # Если доступных нет — берём любой
-        suitable.sort(key=lambda x: float(x.get("price", 9999)))
+        # Если доступных нет — берём любой за $1
         best = suitable[0]
-        logger.info(f"Доступных нет, берём любой: {best['service']['name']} | ${best.get('price')}")
+        logger.info(f"Доступных нет, берём: {best['service']['name']} | ${best.get('price')}")
         return best["id"]
 
     except Exception as e:
@@ -128,7 +128,7 @@ async def buying_loop(plan_id: str):
 
     await bot.send_message(
         ADMIN_ID,
-        f"🚀 Начал скупку <b>{SERVICE_NAME}</b>\n"
+        f"🚀 Начал скупку <b>{SERVICE_NAME}</b> по <b>${TARGET_PRICE}</b>\n"
         f"Пачки по 25 номеров каждые 0.5 сек\n"
         f"Остановить: /stop",
         parse_mode="HTML",
@@ -178,7 +178,7 @@ async def wait_and_start(target: datetime):
         if plan_id:
             await buying_loop(plan_id)
         else:
-            await bot.send_message(ADMIN_ID, f"❌ Не найден тариф для {SERVICE_NAME}")
+            await bot.send_message(ADMIN_ID, f"❌ Не найден тариф {SERVICE_NAME} за ${TARGET_PRICE}")
 
 
 @dp.message(Command("start"))
@@ -186,7 +186,9 @@ async def cmd_start(message: Message):
     if not is_admin(message):
         return
     await message.answer(
-        f"🤖 GotSMS Auto-Buyer\nСервис: <b>{SERVICE_NAME}</b>",
+        f"🤖 GotSMS Auto-Buyer\n"
+        f"Сервис: <b>{SERVICE_NAME}</b>\n"
+        f"Цена: <b>${TARGET_PRICE}</b>",
         parse_mode="HTML",
         reply_markup=menu
     )
@@ -203,13 +205,13 @@ async def cmd_start_now(message: Message):
         await message.answer("⚠️ Уже идёт скупка")
         return
 
-    await message.answer("🔍 Ищу тариф...")
+    await message.answer("🔍 Ищу тариф за $1...")
 
     plan_id = await find_plan_id()
     if not plan_id:
         await message.answer(
-            f"❌ Не найден тариф для <b>{SERVICE_NAME}</b>\n"
-            f"Проверь логи Railway — там будет список всех сервисов, которые видит API.",
+            f"❌ Не найден тариф <b>{SERVICE_NAME}</b> за <b>${TARGET_PRICE}</b>\n"
+            f"Смотри логи Railway — там список всех тарифов.",
             parse_mode="HTML"
         )
         return
@@ -283,6 +285,7 @@ async def cmd_status(message: Message):
     await message.answer(
         f"Статус: <b>{status}</b>\n"
         f"Сервис: {SERVICE_NAME}\n"
+        f"Цена: ${TARGET_PRICE}\n"
         f"Куплено: <b>{bought_count}</b>\n"
         f"МСК: {datetime.now(TZ).strftime('%H:%M:%S')}",
         parse_mode="HTML",
