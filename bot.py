@@ -14,7 +14,7 @@ from aiogram.types import Message, KeyboardButton, ReplyKeyboardMarkup
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 GOTSMS_API_KEY = os.environ["GOTSMS_API_KEY"]
 ADMIN_ID = int(os.environ["ADMIN_ID"])
-SERVICE_NAME = os.getenv("SERVICE_NAME", "Telegram")  # <-- название сервиса
+SERVICE_NAME = os.getenv("SERVICE_NAME", "Telegram")
 # ===============================================
 
 BASE_URL = "https://app.gotsms.com/api"
@@ -55,29 +55,53 @@ async def api_request(method: str, endpoint: str, json_data: dict = None) -> dic
     url = f"{BASE_URL}/{endpoint.lstrip('/')}"
     async with aiohttp.ClientSession() as session:
         async with session.request(method, url, headers=HEADERS, json=json_data, timeout=30) as resp:
-            data = await resp.json()
+            text = await resp.text()
+            try:
+                data = await resp.json()
+            except:
+                logger.error(f"Не JSON ответ: {text[:300]}")
+                return {"success": False}
             return data
 
 
 async def find_plan_id() -> Optional[str]:
-    """Ищем самый дешёвый доступный план нужного сервиса"""
     try:
-        data = await api_request("GET", "rents/plans?per_page=100&include_unavailable=0")
+        # Берём все планы, включая недоступные
+        data = await api_request("GET", "rents/plans?per_page=100&include_unavailable=1")
         plans = data.get("data", [])
+
+        logger.info(f"Получено планов: {len(plans)}")
+        logger.info(f"Ищем сервис содержащий: '{SERVICE_NAME}'")
 
         suitable = []
         for p in plans:
-            name = p.get("service", {}).get("name", "").lower()
-            if SERVICE_NAME.lower() in name and p.get("is_available", False):
+            name = p.get("service", {}).get("name", "")
+            available = p.get("is_available")
+            price = p.get("price")
+            plan_id = p.get("id")
+            logger.info(f"  {name} | available={available} | price={price} | id={plan_id}")
+
+            if SERVICE_NAME.lower() in name.lower():
                 suitable.append(p)
 
         if not suitable:
+            logger.warning("Ни одного плана с таким названием не найдено")
             return None
 
+        # Сначала доступные
+        available = [p for p in suitable if p.get("is_available") is True]
+        if available:
+            available.sort(key=lambda x: float(x.get("price", 9999)))
+            best = available[0]
+            logger.info(f"Выбран доступный: {best['service']['name']} | ${best.get('price')}")
+            return best["id"]
+
+        # Если доступных нет — берём любой
         suitable.sort(key=lambda x: float(x.get("price", 9999)))
         best = suitable[0]
-        logger.info(f"План: {best['service']['name']} | {best.get('duration_translation')} | ${best.get('price')}")
+        logger.info(f"Доступных нет, берём любой: {best['service']['name']} | ${best.get('price')}")
         return best["id"]
+
     except Exception as e:
         logger.error(f"Ошибка поиска плана: {e}")
         return None
@@ -95,7 +119,6 @@ async def buy_bulk(plan_id: str, quantity: int = 25) -> dict:
 
 
 async def buying_loop(plan_id: str):
-    """Скупка пачками по 25 каждые 0.5 сек"""
     global is_buying, bought_count, status
 
     is_buying = True
@@ -107,7 +130,7 @@ async def buying_loop(plan_id: str):
         ADMIN_ID,
         f"🚀 Начал скупку <b>{SERVICE_NAME}</b>\n"
         f"Пачки по 25 номеров каждые 0.5 сек\n"
-        f"Остановить: /stop или кнопка",
+        f"Остановить: /stop",
         parse_mode="HTML",
         reply_markup=menu
     )
@@ -128,7 +151,7 @@ async def buying_loop(plan_id: str):
                         ADMIN_ID,
                         f"✅ Куплено: <b>{bought_count}</b>\n"
                         f"Последняя пачка: +{rented}\n"
-                        f"Последний номер: <code>{last_phone}</code>",
+                        f"Последний: <code>{last_phone}</code>",
                         parse_mode="HTML"
                     )
 
@@ -137,7 +160,7 @@ async def buying_loop(plan_id: str):
     status = "Остановлен"
     await bot.send_message(
         ADMIN_ID,
-        f"🛑 Скупка остановлена.\nВсего куплено: <b>{bought_count}</b>",
+        f"🛑 Остановлено. Куплено: <b>{bought_count}</b>",
         parse_mode="HTML",
         reply_markup=menu
     )
@@ -152,22 +175,18 @@ async def wait_and_start(target: datetime):
 
     if not is_buying:
         plan_id = await find_plan_id()
-        if not plan_id:
-            await bot.send_message(ADMIN_ID, f"❌ Нет доступного тарифа для {SERVICE_NAME}")
-            return
-        await buying_loop(plan_id)
+        if plan_id:
+            await buying_loop(plan_id)
+        else:
+            await bot.send_message(ADMIN_ID, f"❌ Не найден тариф для {SERVICE_NAME}")
 
-
-# ================== КОМАНДЫ ==================
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     if not is_admin(message):
         return
     await message.answer(
-        f"🤖 GotSMS Auto-Buyer\n"
-        f"Сервис: <b>{SERVICE_NAME}</b>\n"
-        f"Режим: пачки по 25 каждые 0.5 сек",
+        f"🤖 GotSMS Auto-Buyer\nСервис: <b>{SERVICE_NAME}</b>",
         parse_mode="HTML",
         reply_markup=menu
     )
@@ -185,9 +204,14 @@ async def cmd_start_now(message: Message):
         return
 
     await message.answer("🔍 Ищу тариф...")
+
     plan_id = await find_plan_id()
     if not plan_id:
-        await message.answer(f"❌ Нет тарифа для <b>{SERVICE_NAME}</b>", parse_mode="HTML")
+        await message.answer(
+            f"❌ Не найден тариф для <b>{SERVICE_NAME}</b>\n"
+            f"Проверь логи Railway — там будет список всех сервисов, которые видит API.",
+            parse_mode="HTML"
+        )
         return
 
     buying_task = asyncio.create_task(buying_loop(plan_id))
@@ -227,7 +251,7 @@ async def cmd_start_at(message: Message, command: CommandObject):
 async def ask_time(message: Message):
     if not is_admin(message):
         return
-    await message.answer("Напиши время в формате:\n<code>/start_at 21:00</code>", parse_mode="HTML")
+    await message.answer("Напиши: /start_at 21:00")
 
 
 @dp.message(Command("stop"))
@@ -259,7 +283,7 @@ async def cmd_status(message: Message):
     await message.answer(
         f"Статус: <b>{status}</b>\n"
         f"Сервис: {SERVICE_NAME}\n"
-        f"Куплено в сессии: <b>{bought_count}</b>\n"
+        f"Куплено: <b>{bought_count}</b>\n"
         f"МСК: {datetime.now(TZ).strftime('%H:%M:%S')}",
         parse_mode="HTML",
         reply_markup=menu
