@@ -1,187 +1,274 @@
 import asyncio
 import logging
 import os
-from datetime import datetime, timedelta
-from decimal import Decimal
+from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
+from typing import Optional
+
 import aiohttp
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject
 from aiogram.types import Message, KeyboardButton, ReplyKeyboardMarkup
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
 
-TOKEN = os.environ['BOT_TOKEN']
-KEY = os.environ['GOTSMS_API_KEY']
-ADMIN = int(os.environ['ADMIN_ID'])
-SERVICE = os.getenv('SERVICE_NAME', 'TestprojectsOne')
-BUDGET = Decimal('300')
-TZ = ZoneInfo('Europe/Moscow')
-BASE = 'https://app.gotsms.com'
-bot = Bot(TOKEN)
+# ================== НАСТРОЙКИ ==================
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+GOTSMS_API_KEY = os.environ["GOTSMS_API_KEY"]
+ADMIN_ID = int(os.environ["ADMIN_ID"])
+SERVICE_NAME = os.getenv("SERVICE_NAME", "Telegram")  # <-- название сервиса
+# ===============================================
+
+BASE_URL = "https://app.gotsms.com/api"
+TZ = ZoneInfo("Europe/Moscow")
+
+HEADERS = {
+    "Authorization": f"Bearer {GOTSMS_API_KEY}",
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-task = None
-scheduled = None
-status = 'Остановлен'
-lock = asyncio.Lock()
-menu = ReplyKeyboardMarkup(keyboard=[
-    [KeyboardButton(text='🕐 Установить время')],
-    [KeyboardButton(text='▶️ Запустить сейчас'), KeyboardButton(text='🛑 Остановить')],
-    [KeyboardButton(text='💳 Купить тестовый номер'), KeyboardButton(text='📊 Статус')],
-], resize_keyboard=True)
 
-class Input(StatesGroup):
-    time = State()
-    confirm = State()
+buying_task: Optional[asyncio.Task] = None
+is_buying = False
+bought_count = 0
+status = "Остановлен"
 
-def allowed(m):
-    return m.from_user and m.from_user.id == ADMIN and m.chat.type == 'private'
+menu = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="🕐 Установить время")],
+        [KeyboardButton(text="▶️ Запустить сейчас"), KeyboardButton(text="🛑 Остановить")],
+        [KeyboardButton(text="📊 Статус")],
+    ],
+    resize_keyboard=True,
+)
 
-def session():
-    return aiohttp.ClientSession(headers={'Authorization': f'Bearer {KEY}', 'Accept': 'application/json'}, timeout=aiohttp.ClientTimeout(total=20))
 
-async def plans(s):
-    async with s.get(BASE+'/api/rents/plans', params={'search': SERVICE, 'duration_type':'day','billing_type':'duration','per_page':100}) as r:
-        r.raise_for_status()
-        data = await r.json()
-    return sorted([p for p in data['data'] if p['service']['name'].casefold()==SERVICE.casefold() and p['duration_in_minutes']==1440 and p['is_available'] and Decimal('0') < Decimal(str(p['price'])) <= BUDGET], key=lambda p: Decimal(str(p['price'])))
+def is_admin(message: Message) -> bool:
+    return message.from_user and message.from_user.id == ADMIN_ID and message.chat.type == "private"
 
-async def monitor(target=None):
-    global status, scheduled
+
+async def api_request(method: str, endpoint: str, json_data: dict = None) -> dict:
+    url = f"{BASE_URL}/{endpoint.lstrip('/')}"
+    async with aiohttp.ClientSession() as session:
+        async with session.request(method, url, headers=HEADERS, json=json_data, timeout=30) as resp:
+            data = await resp.json()
+            return data
+
+
+async def find_plan_id() -> Optional[str]:
+    """Ищем самый дешёвый доступный план нужного сервиса"""
     try:
-        if target:
-            await asyncio.sleep(max(0,(target-datetime.now(TZ)).total_seconds()))
-        scheduled=None
-        status='Мониторинг'
-        async with session() as s:
-            while True:
-                try:
-                    p=await plans(s)
-                    if p:
-                        await bot.send_message(ADMIN,f'Номер доступен: {SERVICE}, цена {p[0]["price"]}. Нажми кнопку покупки.',reply_markup=menu)
-                        break
-                except aiohttp.ClientResponseError as e:
-                    if e.status in (401,403):
-                        await bot.send_message(ADMIN,'Ошибка авторизации GotSMS.'); break
-                    if e.status==429:
-                        await asyncio.sleep(90); continue
-                except (aiohttp.ClientError, asyncio.TimeoutError):
-                    pass
-                await asyncio.sleep(30)
-    except asyncio.CancelledError:
-        raise
+        data = await api_request("GET", "rents/plans?per_page=100&include_unavailable=0")
+        plans = data.get("data", [])
+
+        suitable = []
+        for p in plans:
+            name = p.get("service", {}).get("name", "").lower()
+            if SERVICE_NAME.lower() in name and p.get("is_available", False):
+                suitable.append(p)
+
+        if not suitable:
+            return None
+
+        suitable.sort(key=lambda x: float(x.get("price", 9999)))
+        best = suitable[0]
+        logger.info(f"План: {best['service']['name']} | {best.get('duration_translation')} | ${best.get('price')}")
+        return best["id"]
+    except Exception as e:
+        logger.error(f"Ошибка поиска плана: {e}")
+        return None
+
+
+async def buy_bulk(plan_id: str, quantity: int = 25) -> dict:
+    try:
+        return await api_request("POST", "rents/bulk", {
+            "plan_id": plan_id,
+            "quantity": quantity
+        })
+    except Exception as e:
+        logger.error(f"Ошибка bulk: {e}")
+        return {"success": False}
+
+
+async def buying_loop(plan_id: str):
+    """Скупка пачками по 25 каждые 0.5 сек"""
+    global is_buying, bought_count, status
+
+    is_buying = True
+    bought_count = 0
+    status = "Скупаю"
+    last_report = 0
+
+    await bot.send_message(
+        ADMIN_ID,
+        f"🚀 Начал скупку <b>{SERVICE_NAME}</b>\n"
+        f"Пачки по 25 номеров каждые 0.5 сек\n"
+        f"Остановить: /stop или кнопка",
+        parse_mode="HTML",
+        reply_markup=menu
+    )
+
+    while is_buying:
+        result = await buy_bulk(plan_id, 25)
+
+        if result.get("success"):
+            rented = result.get("meta", {}).get("rented", 0)
+            if rented > 0:
+                bought_count += rented
+                data = result.get("data", [])
+                last_phone = data[-1].get("phone", "—") if data else "—"
+
+                if bought_count - last_report >= 25:
+                    last_report = bought_count
+                    await bot.send_message(
+                        ADMIN_ID,
+                        f"✅ Куплено: <b>{bought_count}</b>\n"
+                        f"Последняя пачка: +{rented}\n"
+                        f"Последний номер: <code>{last_phone}</code>",
+                        parse_mode="HTML"
+                    )
+
+        await asyncio.sleep(0.5)
+
+    status = "Остановлен"
+    await bot.send_message(
+        ADMIN_ID,
+        f"🛑 Скупка остановлена.\nВсего куплено: <b>{bought_count}</b>",
+        parse_mode="HTML",
+        reply_markup=menu
+    )
+
+
+async def wait_and_start(target: datetime):
+    global status
+    status = f"Ожидание до {target.strftime('%H:%M')}"
+    wait_seconds = (target - datetime.now(TZ)).total_seconds()
+    if wait_seconds > 0:
+        await asyncio.sleep(wait_seconds)
+
+    if not is_buying:
+        plan_id = await find_plan_id()
+        if not plan_id:
+            await bot.send_message(ADMIN_ID, f"❌ Нет доступного тарифа для {SERVICE_NAME}")
+            return
+        await buying_loop(plan_id)
+
+
+# ================== КОМАНДЫ ==================
+
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    if not is_admin(message):
+        return
+    await message.answer(
+        f"🤖 GotSMS Auto-Buyer\n"
+        f"Сервис: <b>{SERVICE_NAME}</b>\n"
+        f"Режим: пачки по 25 каждые 0.5 сек",
+        parse_mode="HTML",
+        reply_markup=menu
+    )
+
+
+@dp.message(Command("start_now"))
+@dp.message(F.text == "▶️ Запустить сейчас")
+async def cmd_start_now(message: Message):
+    global buying_task, is_buying
+
+    if not is_admin(message):
+        return
+    if is_buying:
+        await message.answer("⚠️ Уже идёт скупка")
+        return
+
+    await message.answer("🔍 Ищу тариф...")
+    plan_id = await find_plan_id()
+    if not plan_id:
+        await message.answer(f"❌ Нет тарифа для <b>{SERVICE_NAME}</b>", parse_mode="HTML")
+        return
+
+    buying_task = asyncio.create_task(buying_loop(plan_id))
+
+
+@dp.message(Command("start_at"))
+async def cmd_start_at(message: Message, command: CommandObject):
+    global buying_task
+
+    if not is_admin(message):
+        return
+    if is_buying:
+        await message.answer("⚠️ Уже идёт скупка")
+        return
+
+    if not command.args:
+        await message.answer("Пример: /start_at 21:00")
+        return
+
+    try:
+        hour, minute = map(int, command.args.strip().split(":"))
+        t = time(hour=hour, minute=minute)
     except Exception:
-        await bot.send_message(ADMIN,'Ошибка мониторинга. Проверь настройки API.')
-    finally:
-        status='Остановлен'; scheduled=None
+        await message.answer("Формат: 21:00")
+        return
 
-async def cancel():
-    global task, scheduled, status
-    if task and not task.done():
-        task.cancel()
-        await asyncio.gather(task,return_exceptions=True)
-    task=None; scheduled=None; status='Остановлен'
+    now = datetime.now(TZ)
+    target = datetime.combine(now.date(), t, tzinfo=TZ)
+    if target <= now:
+        target += timedelta(days=1)
 
-@dp.message(Command('start'))
-async def start(m:Message,state:FSMContext):
-    if not allowed(m): return
-    await state.clear()
-    await m.answer(f'GotSMS Test Bot\nСервис: {SERVICE}\nАренда: сутки. Время: МСК.',reply_markup=menu)
+    await message.answer(f"⏳ Запуск в {target.strftime('%d.%m %H:%M')} МСК")
+    buying_task = asyncio.create_task(wait_and_start(target))
 
-@dp.message(F.text=='🕐 Установить время')
-async def ask(m:Message,state:FSMContext):
-    if not allowed(m): return
-    await state.set_state(Input.time)
-    await m.answer('Введи время ЧЧ:ММ по Москве.')
 
-async def schedule(m,state,value):
-    global task, scheduled, status
-    try:
-        t=datetime.strptime(value,'%H:%M').time()
-    except ValueError:
-        await m.answer('Формат: 21:30'); return
-    async with lock:
-        await cancel()
-        now=datetime.now(TZ)
-        target=datetime.combine(now.date(),t,tzinfo=TZ)
-        if target<=now: target+=timedelta(days=1)
-        scheduled=target; status='Ожидание'; task=asyncio.create_task(monitor(target))
-    await state.clear()
-    await m.answer(f'Запуск: {target:%d.%m.%Y %H:%M} МСК',reply_markup=menu)
+@dp.message(F.text == "🕐 Установить время")
+async def ask_time(message: Message):
+    if not is_admin(message):
+        return
+    await message.answer("Напиши время в формате:\n<code>/start_at 21:00</code>", parse_mode="HTML")
 
-@dp.message(Command('start_at'))
-async def at(m:Message,state:FSMContext):
-    if not allowed(m): return
-    parts=m.text.split(maxsplit=1)
-    if len(parts)==1: await ask(m,state)
-    else: await schedule(m,state,parts[1].strip())
 
-@dp.message(Command('start_now'))
-@dp.message(F.text=='▶️ Запустить сейчас')
-async def now(m:Message,state:FSMContext):
-    global task,status
-    if not allowed(m): return
-    await state.clear()
-    async with lock:
-        await cancel(); status='Мониторинг'; task=asyncio.create_task(monitor())
-    await m.answer('Мониторинг запущен.',reply_markup=menu)
+@dp.message(Command("stop"))
+@dp.message(F.text == "🛑 Остановить")
+async def cmd_stop(message: Message):
+    global is_buying, buying_task, status
 
-@dp.message(Command('stop'))
-@dp.message(F.text=='🛑 Остановить')
-async def stop(m:Message,state:FSMContext):
-    if not allowed(m): return
-    async with lock: await cancel(); await state.clear()
-    await m.answer('Остановлено. Уже отправленные платежные запросы не отменяются.',reply_markup=menu)
+    if not is_admin(message):
+        return
 
-@dp.message(Command('status'))
-@dp.message(F.text=='📊 Статус')
-async def show(m:Message):
-    if not allowed(m): return
-    await m.answer(f'Статус: {status}\nЗапуск: {scheduled or "нет"}\nМСК: {datetime.now(TZ):%H:%M:%S}',reply_markup=menu)
+    is_buying = False
+    status = "Остановлен"
 
-@dp.message(F.text=='💳 Купить тестовый номер')
-async def buy(m:Message,state:FSMContext):
-    if not allowed(m): return
-    await state.clear()
-    try:
-        async with session() as s: p=await plans(s)
-        if not p:
-            await m.answer('Нет подходящего тарифа.'); return
-        await state.update_data(plan_id=p[0]['id'],price=str(p[0]['price']))
-        await state.set_state(Input.confirm)
-        await m.answer(f'Один номер на сутки. Цена: {p[0]["price"]}. Для реальной оплаты отправь ПОДТВЕРЖДАЮ. Для отмены /stop.')
-    except Exception:
-        await m.answer('Не удалось получить тариф. Проверь API и название сервиса.')
-
-@dp.message(Input.confirm,F.text=='ПОДТВЕРЖДАЮ')
-async def confirm(m:Message,state:FSMContext):
-    if not allowed(m): return
-    async with lock:
-        quote=await state.get_data(); await state.clear()
-        if not quote.get('plan_id'): return
+    if buying_task and not buying_task.done():
+        buying_task.cancel()
         try:
-            async with session() as s:
-                p=next((x for x in await plans(s) if x['id']==quote['plan_id']),None)
-                if not p or Decimal(str(p['price']))!=Decimal(quote['price']):
-                    await m.answer('Тариф изменился. Запроси новую цену.'); return
-                async with s.post(BASE+'/api/rents',json={'plan_id':p['id']}) as r:
-                    if r.status!=201:
-                        await m.answer(f'Ответ API: HTTP {r.status}. Проверь историю аренды перед повтором.'); return
-                    result=await r.json()
-                if not result.get('success'):
-                    await m.answer('Покупка не подтверждена API. Проверь историю.'); return
-                d=result['data']
-                await m.answer(f'Аренда создана.\nНомер: {d.get("phone", "см. кабинет")}\nID: {d.get("id")}\nЦена: {d.get("price", "см. кабинет")}',reply_markup=menu)
-        except Exception:
-            await m.answer('Результат неизвестен. Проверь историю GotSMS перед повтором. Автоповтора нет.')
+            await buying_task
+        except asyncio.CancelledError:
+            pass
 
-@dp.message(Input.time)
-async def time_input(m:Message,state:FSMContext):
-    if allowed(m): await schedule(m,state,(m.text or '').strip())
+    await message.answer(f"🛑 Остановлено\nКуплено: <b>{bought_count}</b>", parse_mode="HTML", reply_markup=menu)
+
+
+@dp.message(Command("status"))
+@dp.message(F.text == "📊 Статус")
+async def cmd_status(message: Message):
+    if not is_admin(message):
+        return
+    await message.answer(
+        f"Статус: <b>{status}</b>\n"
+        f"Сервис: {SERVICE_NAME}\n"
+        f"Куплено в сессии: <b>{bought_count}</b>\n"
+        f"МСК: {datetime.now(TZ).strftime('%H:%M:%S')}",
+        parse_mode="HTML",
+        reply_markup=menu
+    )
+
 
 async def main():
-    await dp.start_polling(bot,handle_as_tasks=False)
+    await dp.start_polling(bot)
 
-if __name__=='__main__':
-    logging.basicConfig(level=logging.INFO)
+
+if __name__ == "__main__":
     asyncio.run(main())
